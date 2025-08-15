@@ -1,137 +1,135 @@
-# app.py
-import os, time
-from threading import Lock
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
 import yfinance as yf
+import pandas as pd
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Allow only your domains; add more if needed
+CORS(app, resources={r"/*": {"origins": [
+    "https://stockpricepredictions.com",
+    "https://www.stockpricepredictions.com"
+]}})
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "ts": int(time.time())}), 200
+YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
-# ---- simple in-memory cache ----
-CACHE_TTL = 300  # 5 minutes
-_cache = {"stock": {}, "indices": {"ts": 0, "data": []}}
-_lock = Lock()
-
-def _safe_float(v):
+def yahoo_search(query: str, quotes=10):
+    """Use Yahoo Finance public search API to find best tickers for a query."""
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {"q": query, "quotesCount": quotes, "newsCount": 0, "enableFuzzyQuery": True}
     try:
-        x = float(v)
-        return x if x == x else None
-    except Exception:
-        return None
+        r = requests.get(url, params=params, headers=YF_HEADERS, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("quotes", [])
+    except Exception as e:
+        return []
 
-def _fetch_ohlc(symbol):
-    """Return (open, high, low, close) for the latest day or raise."""
+def yahoo_trending(region="IN"):
+    """Yahoo trending tickers by region (e.g., IN, US)."""
+    url = f"https://query1.finance.yahoo.com/v1/finance/trending/{region}"
+    try:
+        r = requests.get(url, headers=YF_HEADERS, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        quotes = (data.get("finance", {}).get("result", [{}])[0].get("quotes", [])) or []
+        return quotes
+    except Exception:
+        return []
+
+def resolve_symbol(q: str):
+    """Return best-guess ticker symbol for a free-text query."""
+    q = (q or "").strip()
+    if not q:
+        return None, "empty"
+    # If user already typed a plausible ticker (has dot suffix or uppercase), try as-is first
+    if any(ch.isalpha() for ch in q):
+        sym_try = q.upper().replace(" ", "")
+        quotes = yahoo_search(sym_try, quotes=1)
+        if quotes:
+            return quotes[0].get("symbol"), None
+    # Fallback: search and return the first equity-like quote
+    quotes = yahoo_search(q, quotes=8)
+    for it in quotes:
+        if it.get("symbol"):
+            return it["symbol"], None
+    return None, "not_found"
+
+def get_latest_ohlc(symbol: str):
+    """Fetch latest daily OHLC using yfinance; return last non-NaN row."""
     t = yf.Ticker(symbol)
-    hist = t.history(period="1d", interval="1d")
-    if hist is None or hist.empty:
-        raise RuntimeError(f"No data for {symbol}")
-    row = hist.iloc[-1]
-    o = _safe_float(row.get("Open"))
-    h = _safe_float(row.get("High"))
-    l = _safe_float(row.get("Low"))
-    c = _safe_float(row.get("Close"))
-    if None in (o, h, l, c):
-        raise RuntimeError(f"Incomplete data for {symbol}")
-    return o, h, l, c
+    # Fetch last 5 days to avoid holidays/NaN
+    df = t.history(period="7d", interval="1d", auto_adjust=False)
+    if df is None or df.empty:
+        return None
+    # Take last row with valid Close
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        return None
+    row = df.iloc[-1]
+    return {
+        "open": float(row["Open"]),
+        "high": float(row["High"]),
+        "low": float(row["Low"]),
+        "close": float(row["Close"]),
+    }
+
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "stockpricepredictions-api"})
+
+@app.get("/suggest")
+def suggest():
+    q = request.args.get("q", "").strip()
+    quotes = yahoo_search(q, quotes=10) if q else []
+    results = []
+    for it in quotes:
+        results.append({
+            "symbol": it.get("symbol"),
+            "shortname": it.get("shortname") or it.get("longname"),
+            "exchange": it.get("exchDisp") or it.get("exchange")
+        })
+    return jsonify({"query": q, "results": results})
+
+@app.get("/trending")
+def trending():
+    region = request.args.get("region", "IN").upper()
+    quotes = yahoo_trending(region=region)
+    results = [{"symbol": q.get("symbol"), "shortname": q.get("shortName")} for q in quotes if q.get("symbol")]
+    return jsonify({"region": region, "results": results})
 
 @app.get("/stock")
 def stock():
-    q = (request.args.get("q") or "").strip()
+    q = request.args.get("q", "").strip()
     if not q:
-        return jsonify({"error": "missing q"}), 400
-
-    now = time.time()
-    with _lock:
-        hit = _cache["stock"].get(q)
-        if hit and now - hit["ts"] < CACHE_TTL:
-            return jsonify(hit["data"])
-
-    try:
-        o, h, l, c = _fetch_ohlc(q)
-        data = {"ticker": q, "open": o, "high": h, "low": l, "close": c}
-        with _lock:
-            _cache["stock"][q] = {"ts": now, "data": data}
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
-
-# ---------- batched indices endpoint (ONE call from frontend) ----------
-INDICES = [
-    {"name":"S&P 500",    "sym":"^GSPC"},
-    {"name":"Dow Jones",  "sym":"^DJI"},
-    {"name":"Nasdaq 100", "sym":"^NDX"},
-    {"name":"FTSE 100",   "sym":"^FTSE"},
-    {"name":"DAX",        "sym":"^GDAXI"},
-    {"name":"CAC 40",     "sym":"^FCHI"},
-    {"name":"Nikkei 225", "sym":"^N225"},
-    {"name":"Hang Seng",  "sym":"^HSI"},
-    {"name":"ASX 200",    "sym":"^AXJO"},
-    {"name":"Sensex",     "sym":"^BSESN"},
-    {"name":"Nifty 50",   "sym":"^NSEI"},
-    {"name":"Bank Nifty", "sym":"^NSEBANK"},
-]
-
-@app.get("/indices")
-def indices():
-    now = time.time()
-    with _lock:
-        if now - _cache["indices"]["ts"] < CACHE_TTL and _cache["indices"]["data"]:
-            return jsonify({"results": _cache["indices"]["data"]})
-
-    results = []
-    # fetch sequentially to keep memory low on free tier
-    for it in INDICES:
-        name, sym = it["name"], it["sym"]
-        try:
-            o, h, l, c = _fetch_ohlc(sym)
-            chg = c - o
-            pct = (chg / o * 100.0) if o else 0.0
-            results.append({
-                "name": name,
-                "symbol": sym,
-                "price": round(c, 2),
-                "chg": round(chg, 2),
-                "pct": round(pct, 2),
-                "up": chg >= 0
-            })
-        except Exception:
-            results.append({
-                "name": name, "symbol": sym,
-                "price": "-", "chg": 0.0, "pct": 0.0, "up": False
-            })
-
-    with _lock:
-        _cache["indices"]["ts"] = now
-        _cache["indices"]["data"] = results
-    return jsonify({"results": results})
-
-# ---------- search suggestions ----------
-@app.get("/suggest")
-def suggest():
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify({"results": []})
-    try:
-        # Use Yahoo search API directly (fast + light)
-        import requests
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={q}&quotesCount=10&newsCount=0"
-        resp = requests.get(url, timeout=8)
-        js = resp.json()
-        out = []
-        for r in js.get("quotes", []):
-            out.append({
-                "symbol": r.get("symbol"),
-                "shortname": r.get("shortname") or r.get("longname") or "",
-                "exchange": r.get("exchDisp") or r.get("exchange") or "",
-            })
-        return jsonify({"results": out[:10]})
-    except Exception as e:
-        return jsonify({"results": [], "error": str(e)}), 200
+        return jsonify({"error": "missing query"}), 400
+    symbol, err = resolve_symbol(q)
+    if not symbol:
+        return jsonify({"error": f"symbol not found for query: {q}"}), 404
+    ohlc = get_latest_ohlc(symbol)
+    if not ohlc:
+        return jsonify({"error": f"no price data for {symbol}"}), 404
+    # Yantra-style signal
+    o, h, l, c = ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"]
+    o9, h9, l9, c9 = o % 9, h % 9, l % 9, c % 9
+    layer1 = (o9 + c9) % 9
+    layer2 = (h9 - l9 + 9) % 9
+    bindu = int((layer1 * layer2) % 9)
+    signal = 1 if bindu >= 5 else 0
+    return jsonify({
+        "query": q,
+        "ticker": symbol,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "bindu": bindu,
+        "signal": signal
+    })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
