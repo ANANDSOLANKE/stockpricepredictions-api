@@ -1,140 +1,164 @@
-import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
-import yfinance as yf
 import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 app = Flask(__name__)
-# Allow only your domains; add more if needed
-CORS(app, resources={r"/*": {"origins": [
-    "https://stockpricepredictions.com",
-    "https://www.stockpricepredictions.com"
-]}})
+CORS(app)
 
-YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+# --- Exchange timezone helpers ------------------------------------------------
+
+# Heuristic mapping by ticker suffix. Adjust/extend as you need.
+SUFFIX_TZ_MAP = {
+    ".NS": "Asia/Kolkata",   # NSE India
+    ".BO": "Asia/Kolkata",   # BSE India
+    ".L":  "Europe/London",  # LSE
+    ".PA": "Europe/Paris",   # Euronext Paris
+    ".DE": "Europe/Berlin",  # Xetra (alt suffixes like .F also exist)
+    ".F":  "Europe/Berlin",
+    ".HK": "Asia/Hong_Kong", # HKEX
+    ".T":  "Asia/Tokyo",     # TSE
+    ".SS": "Asia/Shanghai",  # Shanghai
+    ".SZ": "Asia/Shanghai",  # Shenzhen
+    ".SI": "Asia/Singapore", # SGX
+    ".AX": "Australia/Sydney", # ASX
+    ".TO": "America/Toronto",  # TSX
+    ".V":  "America/Toronto",  # TSXV
+    ".KS": "Asia/Seoul",     # KRX
+    ".KQ": "Asia/Seoul",     # KOSDAQ
 }
 
-def yahoo_search(query: str, quotes=10):
-    """Use Yahoo Finance public search API to find best tickers for a query."""
-    url = "https://query2.finance.yahoo.com/v1/finance/search"
-    params = {"q": query, "quotesCount": quotes, "newsCount": 0, "enableFuzzyQuery": True}
+def guess_exchange_tz(symbol: str) -> str:
+    # 1) Try by suffix
+    for suf, tz in SUFFIX_TZ_MAP.items():
+        if symbol.upper().endswith(suf.upper()):
+            return tz
+    # 2) Try yfinance metadata (best effort; may be slow/None sometimes)
     try:
-        r = requests.get(url, params=params, headers=YF_HEADERS, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("quotes", [])
-    except Exception as e:
-        return []
-
-def yahoo_trending(region="IN"):
-    """Yahoo trending tickers by region (e.g., IN, US)."""
-    url = f"https://query1.finance.yahoo.com/v1/finance/trending/{region}"
-    try:
-        r = requests.get(url, headers=YF_HEADERS, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        quotes = (data.get("finance", {}).get("result", [{}])[0].get("quotes", [])) or []
-        return quotes
+        info = yf.Ticker(symbol).fast_info  # faster than .info
+        tz = info.get("timezone")
+        if tz:
+            return tz
     except Exception:
-        return []
+        pass
+    # 3) Fallback to US market tz
+    return "America/New_York"
 
-def resolve_symbol(q: str):
-    """Return best-guess ticker symbol for a free-text query."""
-    q = (q or "").strip()
-    if not q:
-        return None, "empty"
-    # If user already typed a plausible ticker (has dot suffix or uppercase), try as-is first
-    if any(ch.isalpha() for ch in q):
-        sym_try = q.upper().replace(" ", "")
-        quotes = yahoo_search(sym_try, quotes=1)
-        if quotes:
-            return quotes[0].get("symbol"), None
-    # Fallback: search and return the first equity-like quote
-    quotes = yahoo_search(q, quotes=8)
-    for it in quotes:
-        if it.get("symbol"):
-            return it["symbol"], None
-    return None, "not_found"
-
-def get_latest_ohlc(symbol: str):
-    """Fetch latest daily OHLC using yfinance; return last non-NaN row."""
-    t = yf.Ticker(symbol)
-    # Fetch last 5 days to avoid holidays/NaN
-    df = t.history(period="7d", interval="1d", auto_adjust=False)
-    if df is None or df.empty:
-        return None
-    # Take last row with valid Close
-    df = df.dropna(subset=["Close"])
+def to_exchange_local_index(df: pd.DataFrame, exchange_tz: str) -> pd.DataFrame:
+    """Ensure index is timezone-aware and converted to exchange tz."""
     if df.empty:
-        return None
-    row = df.iloc[-1]
-    return {
-        "open": float(row["Open"]),
-        "high": float(row["High"]),
-        "low": float(row["Low"]),
-        "close": float(row["Close"]),
-    }
+        return df
+    idx = df.index
+    if idx.tz is None:
+        # yfinance daily sometimes returns naive index; assume UTC then convert
+        df = df.tz_localize("UTC")
+    # Convert to exchange timezone
+    df = df.tz_convert(exchange_tz)
+    return df
 
-@app.get("/")
-def root():
-    return jsonify({"ok": True, "service": "stockpricepredictions-api"})
+def next_business_day(d: datetime.date) -> datetime.date:
+    """Next weekday (Mon–Fri). Ignores local holidays by requirement."""
+    nd = d + timedelta(days=1)
+    while nd.weekday() >= 5:  # 5=Sat, 6=Sun
+        nd += timedelta(days=1)
+    return nd
 
-@app.get("/suggest")
-def suggest():
-    q = request.args.get("q", "").strip()
-    quotes = yahoo_search(q, quotes=10) if q else []
-    results = []
-    for it in quotes:
-        results.append({
-            "symbol": it.get("symbol"),
-            "shortname": it.get("shortname") or it.get("longname"),
-            "exchange": it.get("exchDisp") or it.get("exchange")
-        })
-    return jsonify({"query": q, "results": results})
+def pick_last_completed_daily_bar(df: pd.DataFrame, exchange_tz: str):
+    """
+    From daily OHLC df indexed by datetime (already in exchange tz), pick last completed bar:
+    - Take rows with index.date < 'today' in exchange tz.
+    - If present, choose the last of those.
+    - Else, if no such rows but df has at least one row, choose the most recent one.
+    Returns (row_series, last_completed_date).
+    """
+    if df.empty:
+        return None, None
 
-@app.get("/trending")
-def trending():
-    region = request.args.get("region", "IN").upper()
-    quotes = yahoo_trending(region=region)
-    results = [{"symbol": q.get("symbol"), "shortname": q.get("shortName")} for q in quotes if q.get("symbol")]
-    return jsonify({"region": region, "results": results})
+    now_ex = datetime.now(ZoneInfo(exchange_tz))
+    today_ex_date = now_ex.date()
 
-@app.get("/stock")
+    # Rows strictly before today in exchange tz
+    mask_before_today = df.index.date < today_ex_date
+    df_before = df[mask_before_today]
+
+    if not df_before.empty:
+        # Normal case: use yesterday’s bar (or last bar before today, e.g., Fri if today is Mon)
+        row = df_before.iloc[-1]
+        last_date = df_before.index[-1].date()
+        return row, last_date
+    else:
+        # Edge: no row strictly before today (thin symbols / first day visible)
+        # Fall back to most recent available bar
+        row = df.iloc[-1]
+        last_date = df.index[-1].date()
+        return row, last_date
+
+# --- API ----------------------------------------------------------------------
+
+@app.route("/stock", methods=["GET"])
 def stock():
-    q = request.args.get("q", "").strip()
-    if not q:
-        return jsonify({"error": "missing query"}), 400
-    symbol, err = resolve_symbol(q)
+    symbol = (request.args.get("symbol") or "").strip()
     if not symbol:
-        return jsonify({"error": f"symbol not found for query: {q}"}), 404
-    ohlc = get_latest_ohlc(symbol)
-    if not ohlc:
-        return jsonify({"error": f"no price data for {symbol}"}), 404
-    # Yantra-style signal
-    o, h, l, c = ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"]
-    o9, h9, l9, c9 = o % 9, h % 9, l % 9, c % 9
-    layer1 = (o9 + c9) % 9
-    layer2 = (h9 - l9 + 9) % 9
-    bindu = int((layer1 * layer2) % 9)
-    signal = 1 if bindu >= 5 else 0
-    return jsonify({
-        "query": q,
-        "ticker": symbol,
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-        "bindu": bindu,
-        "signal": signal
-    })
+        return jsonify({"error": "symbol is required"}), 400
+
+    ex_tz = guess_exchange_tz(symbol)
+
+    # Fetch a small recent window of daily bars (2–3 usable days). 5d gives buffer for weekends.
+    try:
+        hist = yf.download(
+            tickers=symbol,
+            period="7d",            # small lookback is enough
+            interval="1d",
+            auto_adjust=False,
+            progress=False
+        )
+    except Exception as e:
+        return jsonify({"error": f"fetch failed: {str(e)}"}), 502
+
+    if hist is None or hist.empty:
+        return jsonify({"error": "no data"}), 404
+
+    # Standardize column names (yfinance can return lowercase)
+    hist = hist.rename(columns={c: c.capitalize() for c in hist.columns})
+    # Keep only OHLCV if present
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in hist.columns]
+    hist = hist[cols]
+
+    # Convert index to exchange timezone
+    hist = to_exchange_local_index(hist, ex_tz)
+
+    # Pick last completed session’s bar
+    row, last_completed_date = pick_last_completed_daily_bar(hist, ex_tz)
+    if row is None:
+        return jsonify({"error": "no data"}), 404
+
+    # Compute prediction date = next business day (ignoring local holidays)
+    prediction_date = next_business_day(last_completed_date)
+
+    # Build response
+    out = {
+        "symbol": symbol,
+        "exchange_timezone": ex_tz,
+        "last_completed_session_date": last_completed_date.isoformat(),  # YYYY-MM-DD in exchange tz
+        "prediction_date": prediction_date.isoformat(),                  # YYYY-MM-DD (next weekday)
+        "ohlc_used": {
+            "open": float(row.get("Open", np.nan)),
+            "high": float(row.get("High", np.nan)),
+            "low":  float(row.get("Low", np.nan)),
+            "close": float(row.get("Close", np.nan)),
+            "volume": float(row.get("Volume", np.nan)) if "Volume" in row else None
+        }
+    }
+    return jsonify(out), 200
+
+# Health check (optional)
+@app.route("/")
+def root():
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
-
-
-@app.route('/health')
-def health():
-    return {'status': 'ok'}, 200
+    # For local testing only. In production use gunicorn.
+    app.run(host="0.0.0.0", port=8000, debug=True)
