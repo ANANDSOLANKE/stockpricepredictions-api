@@ -1,3 +1,4 @@
+# app.py
 import os
 from datetime import datetime, timedelta, time
 from flask import Flask, request, jsonify
@@ -5,84 +6,40 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import pytz
+import requests
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": [
-    "https://stockpricepredictions.com",
-    "https://www.stockpricepredictions.com",
-    "https://stockpricepredictions-api.onrender.com",
-    "http://localhost:5500",
-    "http://127.0.0.1:5500"
-]}})
+CORS(app, resources={r"/*": {"origins": ["*"]}})  # open for testing; lock down later
 
-# ---------- Venue rules: timezone, hours, workweek ----------
-# Python weekday: Mon=0 ... Sun=6
+# ---------- Venue rules ----------
 MON_FRI = {0,1,2,3,4}
-SUN_THU = {6,0,1,2,3}  # e.g., Saudi (Fri/Sat weekend)
+SUN_THU = {6,0,1,2,3}  # Saudi
 
 EXCHANGES = {
-    # India
-    ".NS": {"tz": "Asia/Kolkata", "start": (9,15),  "end": (15,30), "open_days": MON_FRI, "venue": "NSE"},
-    ".BO": {"tz": "Asia/Kolkata", "start": (9,15),  "end": (15,30), "open_days": MON_FRI, "venue": "BSE"},
-
-    # US
-    ".NY": {"tz": "US/Eastern",   "start": (9,30),  "end": (16,0),  "open_days": MON_FRI, "venue": "NYSE"},
-    ".O":  {"tz": "US/Eastern",   "start": (9,30),  "end": (16,0),  "open_days": MON_FRI, "venue": "NASDAQ"},
-    # default fallback for others → US/Eastern below
-
-    # UK
-    ".L":  {"tz": "Europe/London","start": (8,0),   "end": (16,30), "open_days": MON_FRI, "venue": "LSE"},
-
-    # Hong Kong
-    ".HK": {"tz": "Asia/Hong_Kong","start": (9,30), "end": (16,0),  "open_days": MON_FRI, "venue": "HKEX"},
-
-    # Japan
-    ".T":  {"tz": "Asia/Tokyo",   "start": (9,0),   "end": (15,0),  "open_days": MON_FRI, "venue": "TSE"},
-
-    # China (no lunch breaks modeled)
-    ".SS": {"tz": "Asia/Shanghai","start": (9,30),  "end": (15,0),  "open_days": MON_FRI, "venue": "SSE"},
-    ".SZ": {"tz": "Asia/Shanghai","start": (9,30),  "end": (15,0),  "open_days": MON_FRI, "venue": "SZSE"},
-
-    # Canada
-    ".TO": {"tz": "America/Toronto","start": (9,30),"end": (16,0),  "open_days": MON_FRI, "venue": "TSX"},
-
-    # Australia
-    ".AX": {"tz": "Australia/Sydney","start": (10,0),"end": (16,0), "open_days": MON_FRI, "venue": "ASX"},
-
-    # New Zealand
-    ".NZ": {"tz": "Pacific/Auckland","start": (10,0),"end": (16,45),"open_days": MON_FRI, "venue": "NZX"},
-
-    # Brazil
-    ".SA": {"tz": "America/Sao_Paulo","start": (10,0),"end": (17,30),"open_days": MON_FRI, "venue": "B3"},
-
-    # Germany
-    ".F":  {"tz": "Europe/Berlin","start": (8,0),   "end": (20,0),  "open_days": MON_FRI, "venue": "Xetra"},
-
-    # France
-    ".PA": {"tz": "Europe/Paris", "start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "Euronext Paris"},
-
-    # Italy
-    ".MI": {"tz": "Europe/Rome",  "start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "Borsa Italiana"},
-
-    # Switzerland (Yahoo often .SW or .VX)
-    ".SW": {"tz": "Europe/Zurich","start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "SIX"},
-    ".VX": {"tz": "Europe/Zurich","start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "SIX"},
-
-    # Korea
-    ".KS": {"tz": "Asia/Seoul",   "start": (9,0),   "end": (15,30), "open_days": MON_FRI, "venue": "KRX"},
-    ".KQ": {"tz": "Asia/Seoul",   "start": (9,0),   "end": (15,30), "open_days": MON_FRI, "venue": "KOSDAQ"},
-
-    # Taiwan
-    ".TW": {"tz": "Asia/Taipei",  "start": (9,0),   "end": (13,30), "open_days": MON_FRI, "venue": "TWSE"},
-
-    # Singapore
-    ".SI": {"tz": "Asia/Singapore","start": (9,0),  "end": (17,0),  "open_days": MON_FRI, "venue": "SGX"},
-
-    # Thailand
-    ".BK": {"tz": "Asia/Bangkok", "start": (10,0),  "end": (16,30), "open_days": MON_FRI, "venue": "SET"},
-
-    # Saudi Arabia (Sun-Thu)
-    ".SR": {"tz": "Asia/Riyadh",  "start": (10,0),  "end": (15,0),  "open_days": SUN_THU, "venue": "Tadawul"},
+    ".NS": {"tz": "Asia/Kolkata",     "start": (9,15),  "end": (15,30), "open_days": MON_FRI, "venue": "NSE"},
+    ".BO": {"tz": "Asia/Kolkata",     "start": (9,15),  "end": (15,30), "open_days": MON_FRI, "venue": "BSE"},
+    ".NY": {"tz": "US/Eastern",       "start": (9,30),  "end": (16,0),  "open_days": MON_FRI, "venue": "NYSE"},
+    ".O":  {"tz": "US/Eastern",       "start": (9,30),  "end": (16,0),  "open_days": MON_FRI, "venue": "NASDAQ"},
+    ".L":  {"tz": "Europe/London",    "start": (8,0),   "end": (16,30), "open_days": MON_FRI, "venue": "LSE"},
+    ".HK": {"tz": "Asia/Hong_Kong",   "start": (9,30),  "end": (16,0),  "open_days": MON_FRI, "venue": "HKEX"},
+    ".T":  {"tz": "Asia/Tokyo",       "start": (9,0),   "end": (15,0),  "open_days": MON_FRI, "venue": "TSE"},
+    ".SS": {"tz": "Asia/Shanghai",    "start": (9,30),  "end": (15,0),  "open_days": MON_FRI, "venue": "SSE"},
+    ".SZ": {"tz": "Asia/Shanghai",    "start": (9,30),  "end": (15,0),  "open_days": MON_FRI, "venue": "SZSE"},
+    ".TO": {"tz": "America/Toronto",  "start": (9,30),  "end": (16,0),  "open_days": MON_FRI, "venue": "TSX"},
+    ".AX": {"tz": "Australia/Sydney", "start": (10,0),  "end": (16,0),  "open_days": MON_FRI, "venue": "ASX"},
+    ".NZ": {"tz": "Pacific/Auckland", "start": (10,0),  "end": (16,45), "open_days": MON_FRI, "venue": "NZX"},
+    ".SA": {"tz": "America/Sao_Paulo","start": (10,0),  "end": (17,30), "open_days": MON_FRI, "venue": "B3"},
+    ".F":  {"tz": "Europe/Berlin",    "start": (8,0),   "end": (20,0),  "open_days": MON_FRI, "venue": "Xetra"},
+    ".PA": {"tz": "Europe/Paris",     "start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "Euronext Paris"},
+    ".MI": {"tz": "Europe/Rome",      "start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "Borsa Italiana"},
+    ".SW": {"tz": "Europe/Zurich",    "start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "SIX"},
+    ".VX": {"tz": "Europe/Zurich",    "start": (9,0),   "end": (17,30), "open_days": MON_FRI, "venue": "SIX"},
+    ".KS": {"tz": "Asia/Seoul",       "start": (9,0),   "end": (15,30), "open_days": MON_FRI, "venue": "KRX"},
+    ".KQ": {"tz": "Asia/Seoul",       "start": (9,0),   "end": (15,30), "open_days": MON_FRI, "venue": "KOSDAQ"},
+    ".TW": {"tz": "Asia/Taipei",      "start": (9,0),   "end": (13,30), "open_days": MON_FRI, "venue": "TWSE"},
+    ".SI": {"tz": "Asia/Singapore",   "start": (9,0),   "end": (17,0),  "open_days": MON_FRI, "venue": "SGX"},
+    ".BK": {"tz": "Asia/Bangkok",     "start": (10,0),  "end": (16,30), "open_days": MON_FRI, "venue": "SET"},
+    ".SR": {"tz": "Asia/Riyadh",      "start": (10,0),  "end": (15,0),  "open_days": SUN_THU, "venue": "Tadawul"},
 }
 
 def _venue_info(symbol: str):
@@ -92,15 +49,14 @@ def _venue_info(symbol: str):
             tz = pytz.timezone(info["tz"])
             start = time(*info["start"])
             end = time(*info["end"])
-            open_days = info["open_days"]
-            return info["venue"], tz, start, end, open_days
-    # default → US/Eastern Mon–Fri 09:30–16:00
+            return info["venue"], tz, start, end, info["open_days"]
     return "US", pytz.timezone("US/Eastern"), time(9,30), time(16,0), MON_FRI
 
 def _is_market_open_now(symbol: str):
     venue, tz, start, end, open_days = _venue_info(symbol)
     now = datetime.now(tz)
-    return venue, tz, start, end, open_days, (now.weekday() in open_days and start <= now.time() <= end)
+    open_now = (now.weekday() in open_days) and (start <= now.time() <= end)
+    return venue, tz, start, end, open_days, open_now
 
 def _fetch_recent_daily(symbol: str):
     t = yf.Ticker(symbol)
@@ -112,15 +68,11 @@ def _fetch_recent_daily(symbol: str):
     return df if not df.empty else None
 
 def _previous_completed_daily_row(df: pd.DataFrame, symbol: str):
-    """Pick previous *completed* daily bar (never an in-progress session)."""
-    if df is None or df.empty:
-        return None, None
+    if df is None or df.empty: return None, None
     venue, tz, start, end, open_days, open_now = _is_market_open_now(symbol)
     local_today = datetime.now(tz).date()
     last_idx = df.index[-1].date()
-
-    # If last bar is stamped 'today' in venue tz and we are BEFORE end → step back one.
-    if last_idx == local_today and not (datetime.now(tz).time() >= end):
+    if last_idx == local_today and datetime.now(tz).time() < end:
         if len(df) >= 2:
             idx = df.index[-2]; row = df.iloc[-2]
         else:
@@ -137,23 +89,73 @@ def _next_trading_date(from_idx: pd.Timestamp, symbol: str):
     return datetime(d.year, d.month, d.day)
 
 def predict_next_close_from_prev(prev_row: pd.Series) -> float:
-    # Replace with your model if available
     return float(prev_row["Close"])
 
 @app.route("/health", strict_slashes=False)
 def health():
-    return {"status": "ok"}, 200
+    return {"status":"ok"}, 200
 
+# -------- Suggest & Stock endpoints --------
+Y_SUGGEST_URL = "https://autoc.finance.yahoo.com/autoc"
+
+def yahoo_suggest(query: str, region="IN", lang="en"):
+    r = requests.get(Y_SUGGEST_URL, params={"region": region, "lang": lang, "query": query}, timeout=8)
+    r.raise_for_status()
+    j = r.json()
+    out = []
+    for it in j.get("ResultSet", {}).get("Result", []):
+        out.append({
+            "symbol": it.get("symbol"),
+            "name": it.get("name"),
+            "exch": it.get("exch"),
+            "type": it.get("type"),
+        })
+    return out
+
+@app.route("/suggest", methods=["GET"], strict_slashes=False)
+def suggest():
+    q = (request.args.get("q") or "").strip()
+    if not q: return jsonify({"suggestions": []}), 200
+    try:
+        suggestions = yahoo_suggest(q, region="IN", lang="en")
+        return jsonify({"suggestions": suggestions}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/stock", methods=["GET"], strict_slashes=False)
+def stock():
+    q = (request.args.get("q") or "").strip()
+    if not q: return jsonify({"error": "q required"}), 400
+    try:
+        t = yf.Ticker(q)
+        price = None
+        info = getattr(t, "fast_info", None)
+        if info:
+            price = float(getattr(info, "last_price", None) or 0.0)
+        if not price or price == 0.0:
+            df = t.history(period="5d", interval="1d", auto_adjust=False)
+            if df is not None and not df.empty:
+                price = float(df["Close"].iloc[-1])
+        change_pct = None
+        df2 = t.history(period="2d", interval="1d", auto_adjust=False)
+        if df2 is not None and len(df2) >= 2:
+            c1 = float(df2["Close"].iloc[-1]); c0 = float(df2["Close"].iloc[-2])
+            if c0: change_pct = (c1 - c0) / c0 * 100.0
+        return jsonify({"symbol": q, "price": price, "change_pct": change_pct}), 200
+    except Exception as e:
+        return jsonify({"error": f"quote failed: {e}"}), 500
+
+# --------------- Prediction endpoint ---------------
 @app.route("/predict-next", methods=["GET"], strict_slashes=False)
 def predict_next():
     symbol = (request.args.get("symbol") or "RELIANCE.NS").strip().upper()
     df = _fetch_recent_daily(symbol)
     if df is None:
-        return jsonify({"error": "no OHLC available for symbol"}), 404
+        return jsonify({"error":"no OHLC available for symbol"}), 404
 
     idx, prev_row = _previous_completed_daily_row(df, symbol)
     if idx is None or prev_row is None:
-        return jsonify({"error": "insufficient data"}), 404
+        return jsonify({"error":"insufficient data"}), 404
 
     target_date = _next_trading_date(idx, symbol)
     venue, tz, start, end, open_days, open_now = _is_market_open_now(symbol)
