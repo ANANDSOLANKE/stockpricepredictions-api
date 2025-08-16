@@ -9,7 +9,7 @@ import requests
 import re
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["*"]}})  # loosen as needed
+CORS(app, resources={r"/*": {"origins": ["*"]}})
 
 # ---------- Venue rules: timezone, hours, workweek ----------
 MON_FRI = {0,1,2,3,4}
@@ -69,11 +69,11 @@ def _venue_info(symbol: str):
             start = time(*info["start"])
             end = time(*info["end"])
             return info["venue"], tz, start, end, info["open_days"]
-    # default → US/Eastern
+    # default → US/Eastern (covers symbols like GOOGL, AAPL)
     return "US", pytz.timezone("US/Eastern"), time(9,30), time(16,0), MON_FRI
 
-def _is_market_open_now(symbol: str):
-    venue, tz, start, end, open_days = _venue_info(symbol)
+def _is_market_open_now(symbol_or_suffix: str):
+    venue, tz, start, end, open_days = _venue_info(symbol_or_suffix)
     now = datetime.now(tz)
     open_now = (now.weekday() in open_days) and (start <= now.time() <= end)
     return venue, tz, start, end, open_days, open_now
@@ -92,7 +92,7 @@ def _previous_completed_daily_row(df: pd.DataFrame, symbol: str):
     venue, tz, start, end, open_days, open_now = _is_market_open_now(symbol)
     local_today = datetime.now(tz).date()
     last_idx = df.index[-1].date()
-    # If last bar is stamped today and we're before end-of-day, step back
+    # If last bar is stamped 'today' but before session end, step back one
     if last_idx == local_today and datetime.now(tz).time() < end:
         if len(df) >= 2:
             idx = df.index[-2]; row = df.iloc[-2]
@@ -110,7 +110,7 @@ def _next_trading_date(from_idx: pd.Timestamp, symbol: str):
     return datetime(d.year, d.month, d.day)
 
 def predict_next_close_from_prev(prev_row: pd.Series) -> float:
-    # Baseline: next close ≈ previous close (replace with ML later if you want)
+    # Baseline: next close ≈ previous close (replace with ML later)
     return float(prev_row["Close"])
 
 @app.route("/health", strict_slashes=False)
@@ -207,6 +207,33 @@ def suggest():
         pass
     return jsonify({"suggestions": _local_guess(q), "fallback": True}), 200
 
+# ---------------------- Resolve (free text -> best symbol) ----------------------
+@app.route("/resolve", methods=["GET"], strict_slashes=False)
+def resolve():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"query": q, "symbol": None}), 200
+    try:
+        res = _yahoo_search(q, region="IN", lang="en")
+        if res:
+            def score(item):
+                sym = (item.get("symbol") or "").upper()
+                exact = 1 if sym == q.upper() else 0
+                eq    = 1 if (item.get("type") or "").lower() in ("equity","equities","etf","mutualfund","commonstock","closedfund") else 0
+                nosuf = 1 if "." not in sym else 0
+                return (exact, eq, nosuf)
+            best = sorted(res, key=score, reverse=True)[0]
+            return jsonify({
+                "query": q,
+                "symbol": best.get("symbol"),
+                "name": best.get("name"),
+                "exch": best.get("exch"),
+                "type": best.get("type")
+            }), 200
+    except Exception:
+        pass
+    return jsonify({"query": q, "symbol": q.upper()}), 200
+
 # ---------------------- STOCK (for world ribbon) ----------------------
 @app.route("/stock", methods=["GET"], strict_slashes=False)
 def stock():
@@ -275,6 +302,33 @@ def predict_next():
         }
     }
     return jsonify(payload), 200
+
+# ---------------------- Global markets status (panel) ----------------------
+@app.route("/markets-status", methods=["GET"], strict_slashes=False)
+def markets_status():
+    # Build unique venues list (some suffixes share venue, e.g., SIX)
+    seen = {}
+    for suf, info in EXCHANGES.items():
+        key = info["venue"]
+        if key not in seen:
+            tz = pytz.timezone(info["tz"])
+            start = time(*info["start"])
+            end = time(*info["end"])
+            now_local = datetime.now(tz)
+            is_open = (now_local.weekday() in info["open_days"]) and (start <= now_local.time() <= end)
+            seen[key] = {
+                "venue": key,
+                "local_time": now_local.strftime("%Y-%m-%d %H:%M"),
+                "market_open_now": is_open,
+                "market_status": "Open" if is_open else "Closed",
+                "local_tz": info["tz"],
+                "hours_local": {
+                    "start": f"{start.hour:02d}:{start.minute:02d}",
+                    "end": f"{end.hour:02d}:{end.minute:02d}",
+                    "open_days": sorted(list(info["open_days"]))
+                }
+            }
+    return jsonify({"markets": list(seen.values())}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
