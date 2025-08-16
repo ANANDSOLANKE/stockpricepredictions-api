@@ -10,23 +10,21 @@ import yfinance as yf
 app = Flask(__name__)
 CORS(app)
 
-# --- Timezone mapping by ticker suffix (fallback to NY) ---
 SUFFIX_TZ = {
-    ".NS": "Asia/Kolkata", ".BO": "Asia/Kolkata",   # India (NSE/BSE)
-    ".L": "Europe/London",                          # London
-    ".TO": "America/Toronto", ".V": "America/Toronto",  # Toronto
-    ".HK": "Asia/Hong_Kong",                        # Hong Kong
-    ".T": "Asia/Tokyo",                             # Tokyo
-    ".SS": "Asia/Shanghai", ".SZ": "Asia/Shanghai", # Shanghai/Shenzhen
-    ".KS": "Asia/Seoul",                            # Korea
-    ".TW": "Asia/Taipei",                           # Taiwan
-    ".SI": "Asia/Singapore",                        # Singapore
-    ".AX": "Australia/Sydney",                      # Australia
-    ".NZ": "Pacific/Auckland"                       # New Zealand
+    ".NS": "Asia/Kolkata", ".BO": "Asia/Kolkata",
+    ".L": "Europe/London",
+    ".TO": "America/Toronto", ".V": "America/Toronto",
+    ".HK": "Asia/Hong_Kong",
+    ".T": "Asia/Tokyo",
+    ".SS": "Asia/Shanghai", ".SZ": "Asia/Shanghai",
+    ".KS": "Asia/Seoul",
+    ".TW": "Asia/Taipei",
+    ".SI": "Asia/Singapore",
+    ".AX": "Australia/Sydney",
+    ".NZ": "Pacific/Auckland"
 }
 DEFAULT_TZ = "America/New_York"
 
-# Popular index aliases → Yahoo tickers
 INDEX_ALIASES = {
     "NIFTY": "^NSEI", "NIFTY50": "^NSEI",
     "BANKNIFTY": "^NSEBANK", "NIFTYBANK": "^NSEBANK",
@@ -41,28 +39,20 @@ def guess_exchange_tz(ticker: str) -> str:
     for suf, tz in SUFFIX_TZ.items():
         if t.endswith(suf.upper()):
             return tz
-    # basic index handling
     if t.startswith("^"):
         if t.startswith("^NSE") or t.startswith("^BSE"):
             return "Asia/Kolkata"
     return DEFAULT_TZ
 
 def next_weekday(d: datetime) -> datetime:
-    """Return next weekday (Mon–Fri), ignoring local holidays."""
     nd = d + timedelta(days=1)
-    while nd.weekday() >= 5:  # 5=Sat, 6=Sun
+    while nd.weekday() >= 5:
         nd += timedelta(days=1)
     return nd
 
 def choose_completed_bar(df: pd.DataFrame, tzname: str) -> pd.Series | None:
-    """
-    Choose the last completed bar strictly before 'today' in the exchange timezone.
-    If no row strictly before today exists (e.g., market closed), use the most recent row.
-    """
     if df is None or df.empty:
         return None
-
-    # yfinance daily index may be naive (UTC) → localize then convert
     if df.index.tz is None:
         df = df.tz_localize("UTC")
     df = df.tz_convert(ZoneInfo(tzname))
@@ -70,25 +60,19 @@ def choose_completed_bar(df: pd.DataFrame, tzname: str) -> pd.Series | None:
     now_tz = datetime.now(ZoneInfo(tzname))
     today_date = now_tz.date()
 
-    # strictly before today
     df_before_today = df[df.index.date < today_date]
     if not df_before_today.empty:
         return df_before_today.iloc[-1]
     return df.iloc[-1]
 
 def build_payload(ticker: str, row: pd.Series, tzname: str, rows_count: int):
-    used_dt = row.name  # tz-aware
+    used_dt = row.name
     used_session_date = used_dt.date()
-
-    # prediction date = next weekday after used_session_date (ignore holidays)
     pred_date = next_weekday(datetime(
         used_session_date.year, used_session_date.month, used_session_date.day,
         tzinfo=ZoneInfo(tzname)
     )).date()
-
-    o = float(row["Open"]); h = float(row["High"])
-    l = float(row["Low"]);  c = float(row["Close"])
-
+    o = float(row["Open"]); h = float(row["High"]); l = float(row["Low"]); c = float(row["Close"])
     return {
         "ticker": ticker,
         "exchange_timezone": tzname,
@@ -100,23 +84,15 @@ def build_payload(ticker: str, row: pd.Series, tzname: str, rows_count: int):
     }
 
 def _dl_once(sym: str, period: str):
-    return yf.download(
-        sym, period=period, interval="1d",
-        auto_adjust=False, progress=False, threads=False
-    )
+    return yf.download(sym, period=period, interval="1d",
+                       auto_adjust=False, progress=False, threads=False)
 
 def smart_download(q: str):
-    """
-    Try: exact/alias → (5d, 10d) and, if no suffix & not index, try .NS as well.
-    Returns (symbol_used, df_cleaned, tried_list)
-    """
     tried = []
     cand = INDEX_ALIASES.get(q.upper(), q)
-
-    # Candidate symbol list
     cands = [cand]
     if ("." not in q) and (not q.startswith("^")):
-        cands.append(q + ".NS")  # helpful default for India
+        cands.append(q + ".NS")  # handy default for India
 
     for sym in cands:
         for period in ("5d", "10d"):
@@ -126,10 +102,9 @@ def smart_download(q: str):
             except Exception:
                 df = None
             if df is not None and not df.empty:
-                # flatten multiindex columns if present
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = [c[0] for c in df.columns]
-                keep = df[["Open", "High", "Low", "Close"]].dropna(how="all")
+                keep = df[["Open","High","Low","Close"]].dropna(how="all")
                 if not keep.empty:
                     return sym, keep, tried
     return None, None, tried
@@ -140,10 +115,6 @@ def health():
 
 @app.get("/stock")
 def stock():
-    """
-    /stock?q=RELIANCE (auto-tries .NS) or /stock?q=AAPL or /stock?q=^NSEI
-    Picks last completed session (strictly < today's date in exchange tz).
-    """
     q = (request.args.get("q") or "").strip()
     debug = request.args.get("debug") == "1"
     if not q:
