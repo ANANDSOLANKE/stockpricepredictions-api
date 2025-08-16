@@ -1,1 +1,1 @@
-web: gunicorn app_predict_next:app
+web: gunicorn app:app
