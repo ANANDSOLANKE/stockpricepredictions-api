@@ -1,146 +1,140 @@
 import os
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-
-import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
 import yfinance as yf
+import pandas as pd
 
 app = Flask(__name__)
-CORS(app)
+# Allow only your domains; add more if needed
+CORS(app, resources={r"/*": {"origins": [
+    "https://stockpricepredictions.com",
+    "https://www.stockpricepredictions.com"
+]}})
 
-SUFFIX_TZ = {
-    ".NS": "Asia/Kolkata", ".BO": "Asia/Kolkata",
-    ".L": "Europe/London",
-    ".TO": "America/Toronto", ".V": "America/Toronto",
-    ".HK": "Asia/Hong_Kong",
-    ".T": "Asia/Tokyo",
-    ".SS": "Asia/Shanghai", ".SZ": "Asia/Shanghai",
-    ".KS": "Asia/Seoul",
-    ".TW": "Asia/Taipei",
-    ".SI": "Asia/Singapore",
-    ".AX": "Australia/Sydney",
-    ".NZ": "Pacific/Auckland"
-}
-DEFAULT_TZ = "America/New_York"
-
-INDEX_ALIASES = {
-    "NIFTY": "^NSEI", "NIFTY50": "^NSEI",
-    "BANKNIFTY": "^NSEBANK", "NIFTYBANK": "^NSEBANK",
-    "SENSEX": "^BSESN",
-    "DOW": "^DJI", "DJI": "^DJI",
-    "SPX": "^GSPC", "S&P500": "^GSPC",
-    "NASDAQ": "^IXIC"
+YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-def guess_exchange_tz(ticker: str) -> str:
-    t = ticker.upper()
-    for suf, tz in SUFFIX_TZ.items():
-        if t.endswith(suf.upper()):
-            return tz
-    if t.startswith("^"):
-        if t.startswith("^NSE") or t.startswith("^BSE"):
-            return "Asia/Kolkata"
-    return DEFAULT_TZ
+def yahoo_search(query: str, quotes=10):
+    """Use Yahoo Finance public search API to find best tickers for a query."""
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {"q": query, "quotesCount": quotes, "newsCount": 0, "enableFuzzyQuery": True}
+    try:
+        r = requests.get(url, params=params, headers=YF_HEADERS, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("quotes", [])
+    except Exception as e:
+        return []
 
-def next_weekday(d: datetime) -> datetime:
-    nd = d + timedelta(days=1)
-    while nd.weekday() >= 5:
-        nd += timedelta(days=1)
-    return nd
+def yahoo_trending(region="IN"):
+    """Yahoo trending tickers by region (e.g., IN, US)."""
+    url = f"https://query1.finance.yahoo.com/v1/finance/trending/{region}"
+    try:
+        r = requests.get(url, headers=YF_HEADERS, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        quotes = (data.get("finance", {}).get("result", [{}])[0].get("quotes", [])) or []
+        return quotes
+    except Exception:
+        return []
 
-def choose_completed_bar(df: pd.DataFrame, tzname: str) -> pd.Series | None:
+def resolve_symbol(q: str):
+    """Return best-guess ticker symbol for a free-text query."""
+    q = (q or "").strip()
+    if not q:
+        return None, "empty"
+    # If user already typed a plausible ticker (has dot suffix or uppercase), try as-is first
+    if any(ch.isalpha() for ch in q):
+        sym_try = q.upper().replace(" ", "")
+        quotes = yahoo_search(sym_try, quotes=1)
+        if quotes:
+            return quotes[0].get("symbol"), None
+    # Fallback: search and return the first equity-like quote
+    quotes = yahoo_search(q, quotes=8)
+    for it in quotes:
+        if it.get("symbol"):
+            return it["symbol"], None
+    return None, "not_found"
+
+def get_latest_ohlc(symbol: str):
+    """Fetch latest daily OHLC using yfinance; return last non-NaN row."""
+    t = yf.Ticker(symbol)
+    # Fetch last 5 days to avoid holidays/NaN
+    df = t.history(period="7d", interval="1d", auto_adjust=False)
     if df is None or df.empty:
         return None
-    if df.index.tz is None:
-        df = df.tz_localize("UTC")
-    df = df.tz_convert(ZoneInfo(tzname))
-
-    now_tz = datetime.now(ZoneInfo(tzname))
-    today_date = now_tz.date()
-
-    df_before_today = df[df.index.date < today_date]
-    if not df_before_today.empty:
-        return df_before_today.iloc[-1]
-    return df.iloc[-1]
-
-def build_payload(ticker: str, row: pd.Series, tzname: str, rows_count: int):
-    used_dt = row.name
-    used_session_date = used_dt.date()
-    pred_date = next_weekday(datetime(
-        used_session_date.year, used_session_date.month, used_session_date.day,
-        tzinfo=ZoneInfo(tzname)
-    )).date()
-    o = float(row["Open"]); h = float(row["High"]); l = float(row["Low"]); c = float(row["Close"])
+    # Take last row with valid Close
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+        return None
+    row = df.iloc[-1]
     return {
-        "ticker": ticker,
-        "exchange_timezone": tzname,
-        "used_session_date": used_session_date.isoformat(),
-        "prediction_date": pred_date.isoformat(),
-        "ohlc": {"open": o, "high": h, "low": l, "close": c},
-        "source_rows": int(rows_count),
-        "note": "Bar = last completed session strictly before 'today' in exchange tz."
+        "open": float(row["Open"]),
+        "high": float(row["High"]),
+        "low": float(row["Low"]),
+        "close": float(row["Close"]),
     }
 
-def _dl_once(sym: str, period: str):
-    return yf.download(sym, period=period, interval="1d",
-                       auto_adjust=False, progress=False, threads=False)
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "stockpricepredictions-api"})
 
-def smart_download(q: str):
-    tried = []
-    cand = INDEX_ALIASES.get(q.upper(), q)
-    cands = [cand]
-    if ("." not in q) and (not q.startswith("^")):
-        cands.append(q + ".NS")  # handy default for India
+@app.get("/suggest")
+def suggest():
+    q = request.args.get("q", "").strip()
+    quotes = yahoo_search(q, quotes=10) if q else []
+    results = []
+    for it in quotes:
+        results.append({
+            "symbol": it.get("symbol"),
+            "shortname": it.get("shortname") or it.get("longname"),
+            "exchange": it.get("exchDisp") or it.get("exchange")
+        })
+    return jsonify({"query": q, "results": results})
 
-    for sym in cands:
-        for period in ("5d", "10d"):
-            tried.append(f"{sym}@{period}")
-            try:
-                df = _dl_once(sym, period)
-            except Exception:
-                df = None
-            if df is not None and not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = [c[0] for c in df.columns]
-                keep = df[["Open","High","Low","Close"]].dropna(how="all")
-                if not keep.empty:
-                    return sym, keep, tried
-    return None, None, tried
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}, 200
+@app.get("/trending")
+def trending():
+    region = request.args.get("region", "IN").upper()
+    quotes = yahoo_trending(region=region)
+    results = [{"symbol": q.get("symbol"), "shortname": q.get("shortName")} for q in quotes if q.get("symbol")]
+    return jsonify({"region": region, "results": results})
 
 @app.get("/stock")
 def stock():
-    q = (request.args.get("q") or "").strip()
-    debug = request.args.get("debug") == "1"
+    q = request.args.get("q", "").strip()
     if not q:
-        return jsonify({"error": "missing query param 'q'"}), 400
-
-    sym, df, tried = smart_download(q)
-    if df is None:
-        payload = {"error": "no data"}
-        if debug:
-            payload["tried"] = tried
-        return jsonify(payload), 404
-
-    tzname = guess_exchange_tz(sym or q)
-    row = choose_completed_bar(df, tzname)
-    if row is None:
-        payload = {"error": "could not choose bar"}
-        if debug:
-            payload["tried"] = tried
-            payload["rows"] = int(df.shape[0]) if df is not None else 0
-        return jsonify(payload), 404
-
-    out = build_payload(sym or q, row, tzname, rows_count=df.shape[0])
-    if debug:
-        out["tried"] = tried
-    return jsonify(out), 200
+        return jsonify({"error": "missing query"}), 400
+    symbol, err = resolve_symbol(q)
+    if not symbol:
+        return jsonify({"error": f"symbol not found for query: {q}"}), 404
+    ohlc = get_latest_ohlc(symbol)
+    if not ohlc:
+        return jsonify({"error": f"no price data for {symbol}"}), 404
+    # Yantra-style signal
+    o, h, l, c = ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"]
+    o9, h9, l9, c9 = o % 9, h % 9, l % 9, c % 9
+    layer1 = (o9 + c9) % 9
+    layer2 = (h9 - l9 + 9) % 9
+    bindu = int((layer1 * layer2) % 9)
+    signal = 1 if bindu >= 5 else 0
+    return jsonify({
+        "query": q,
+        "ticker": symbol,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "bindu": bindu,
+        "signal": signal
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
+
+
+@app.route('/health')
+def health():
+    return {'status': 'ok'}, 200
