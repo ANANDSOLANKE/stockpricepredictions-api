@@ -1,8 +1,7 @@
 flask
 flask-cors
-yfinance
-pandas
-numpy
-requests
 gunicorn
-pytz
+numpy
+pandas
+requests
+yfinance
