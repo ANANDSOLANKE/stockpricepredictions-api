@@ -1,4 +1,3 @@
-
 import os
 from datetime import datetime, timedelta, time
 from flask import Flask, request, jsonify
@@ -7,9 +6,10 @@ import yfinance as yf
 import pandas as pd
 import pytz
 import requests
+import re
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ["*"]}})  # tighten later
+CORS(app, resources={r"/*": {"origins": ["*"]}})  # loosen as needed
 
 # ---------- Venue rules: timezone, hours, workweek ----------
 MON_FRI = {0,1,2,3,4}
@@ -57,7 +57,7 @@ EXCHANGES = {
     ".SI": {"tz": "Asia/Singapore",   "start": (9,0),   "end": (17,0),  "open_days": MON_FRI, "venue": "SGX"},
     # Thailand
     ".BK": {"tz": "Asia/Bangkok",     "start": (10,0),  "end": (16,30), "open_days": MON_FRI, "venue": "SET"},
-    # Saudi Arabia (Sun-Thu)
+    # Saudi (Sun–Thu)
     ".SR": {"tz": "Asia/Riyadh",      "start": (10,0),  "end": (15,0),  "open_days": SUN_THU, "venue": "Tadawul"},
 }
 
@@ -92,7 +92,7 @@ def _previous_completed_daily_row(df: pd.DataFrame, symbol: str):
     venue, tz, start, end, open_days, open_now = _is_market_open_now(symbol)
     local_today = datetime.now(tz).date()
     last_idx = df.index[-1].date()
-    # If last bar is 'today' and we're before EOD, step back.
+    # If last bar is stamped today and we're before end-of-day, step back
     if last_idx == local_today and datetime.now(tz).time() < end:
         if len(df) >= 2:
             idx = df.index[-2]; row = df.iloc[-2]
@@ -110,42 +110,104 @@ def _next_trading_date(from_idx: pd.Timestamp, symbol: str):
     return datetime(d.year, d.month, d.day)
 
 def predict_next_close_from_prev(prev_row: pd.Series) -> float:
+    # Baseline: next close ≈ previous close (replace with ML later if you want)
     return float(prev_row["Close"])
 
-from flask import Flask
 @app.route("/health", strict_slashes=False)
 def health():
     return {"status":"ok"}, 200
 
-# Optional suggest/stock for compatibility
-Y_SUGGEST_URL = "https://autoc.finance.yahoo.com/autoc"
-import requests
+# ---------------------- SUGGEST (robust with fallbacks) ----------------------
+Y_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
+Y_AUTOC_URL  = "https://autoc.finance.yahoo.com/autoc"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
 
-def yahoo_suggest(query: str, region="IN", lang="en"):
-    r = requests.get(Y_SUGGEST_URL, params={"region": region, "lang": lang, "query": query}, timeout=8)
+def _yahoo_search(query: str, region="IN", lang="en"):
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://finance.yahoo.com/",
+        "Origin":  "https://finance.yahoo.com",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    params = {"q": query, "lang": lang, "region": region, "quotesCount": 10, "newsCount": 0}
+    r = requests.get(Y_SEARCH_URL, headers=hdrs, params=params, timeout=8)
+    r.raise_for_status()
+    j = r.json()
+    out = []
+    for it in j.get("quotes", []):
+        sym  = it.get("symbol")
+        name = it.get("shortname") or it.get("longname") or it.get("symbol") or ""
+        exch = it.get("exchDisp") or it.get("exchange") or ""
+        if sym:
+            out.append({"symbol": sym, "name": name, "exch": exch, "type": it.get("quoteType")})
+    return out
+
+def _yahoo_autoc(query: str, region="IN", lang="en"):
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://finance.yahoo.com/",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    r = requests.get(Y_AUTOC_URL, headers=hdrs, params={"region":region,"lang":lang,"query":query}, timeout=8)
     r.raise_for_status()
     j = r.json()
     out = []
     for it in j.get("ResultSet", {}).get("Result", []):
         out.append({
             "symbol": it.get("symbol"),
-            "name": it.get("name"),
-            "exch": it.get("exch"),
-            "type": it.get("type"),
+            "name":   it.get("name"),
+            "exch":   it.get("exch"),
+            "type":   it.get("type"),
         })
     return out
 
-from flask import request, jsonify
+LOCAL_SUFFIXES = [
+    ".NS",".BO",".NY",".O",".L",".HK",".T",".SS",".SZ",".TO",".AX",".NZ",
+    ".SA",".F",".PA",".MI",".SW",".VX",".KS",".KQ",".TW",".SI",".BK",".SR"
+]
+
+def _local_guess(query: str):
+    q = (query or "").strip().upper()
+    out = []
+    if not q:
+        return out
+    if re.search(r"\.[A-Z]{1,3}$", q):
+        out.append({"symbol": q, "name": "Typed symbol", "exch": "", "type": "EQUITY"})
+        return out
+    preferred = [".NS", ".BO", ".O", ".NY", ".L", ".HK", ".T"]
+    seen = set()
+    for suf in preferred + [s for s in LOCAL_SUFFIXES if s not in preferred]:
+        sym = q + suf
+        if sym in seen: continue
+        seen.add(sym)
+        out.append({"symbol": sym, "name": f"{q} on {suf}", "exch": suf.strip("."), "type": "EQUITY"})
+        if len(out) >= 12: break
+    return out
+
 @app.route("/suggest", methods=["GET"], strict_slashes=False)
 def suggest():
     q = (request.args.get("q") or "").strip()
-    if not q: return jsonify({"suggestions": []}), 200
+    if not q:
+        return jsonify({"suggestions": []}), 200
     try:
-        suggestions = yahoo_suggest(q, region="IN", lang="en")
-        return jsonify({"suggestions": suggestions}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        s = _yahoo_search(q, region="IN", lang="en")
+        if s:
+            return jsonify({"suggestions": s}), 200
+    except Exception:
+        pass
+    try:
+        s2 = _yahoo_autoc(q, region="IN", lang="en")
+        if s2:
+            return jsonify({"suggestions": s2}), 200
+    except Exception:
+        pass
+    return jsonify({"suggestions": _local_guess(q), "fallback": True}), 200
 
+# ---------------------- STOCK (for world ribbon) ----------------------
 @app.route("/stock", methods=["GET"], strict_slashes=False)
 def stock():
     q = (request.args.get("q") or "").strip()
@@ -169,6 +231,7 @@ def stock():
     except Exception as e:
         return jsonify({"error": f"quote failed: {e}"}), 500
 
+# ---------------------- PREDICT NEXT (prev-day OHLC, next trading date) ----------------------
 @app.route("/predict-next", methods=["GET"], strict_slashes=False)
 def predict_next():
     symbol = (request.args.get("symbol") or "RELIANCE.NS").strip().upper()
